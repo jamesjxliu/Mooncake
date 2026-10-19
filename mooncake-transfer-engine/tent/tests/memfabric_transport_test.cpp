@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "memfabric_allocator.h"
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/transport/memfabric/memfabric_transport.h"
@@ -148,6 +149,7 @@ struct MockMemFabricState {
     std::unordered_set<uint64_t> pending;
     std::unordered_map<uint64_t, std::pair<int32_t, int32_t>> results;
     int init_calls = 0;
+    int mem_free_calls = 0;
     int32_t init_ret = 0;
     int uninit_calls = 0;
     int config_init_calls = 0;
@@ -176,6 +178,17 @@ struct MockMemFabricState {
 };
 
 static std::shared_ptr<MockMemFabricState> g_state;
+
+int32_t mockSmemMemAlloc(uint16_t, uint64_t size, uint32_t, void** address) {
+    *address = std::malloc(size);
+    return *address ? 0 : -1;
+}
+
+int32_t mockSmemMemFree(void* address) {
+    ++g_state->mem_free_calls;
+    std::free(address);
+    return 0;
+}
 
 int32_t mockSmemTransInit(uint32_t, uint32_t) {
     std::lock_guard<std::mutex> lock(g_state->mu);
@@ -330,6 +343,7 @@ Request MakeRead(void* src, uint64_t dest, size_t len) {
 class MemFabricTransportTest : public ::testing::Test {
    protected:
     void SetUp() override {
+        unsetenv("MF_STORE_PROTOCOL");
         ResetAcl();
         g_state = std::make_shared<MockMemFabricState>();
         state_ = g_state;
@@ -353,12 +367,22 @@ class MemFabricTransportTest : public ::testing::Test {
         ResetMockApi();
         g_state.reset();
         unsetenv("MF_PROTOCOL");
+        unsetenv("MF_STORE_PROTOCOL");
     }
 
-    Status Install() {
-        setenv("MF_PROTOCOL", "device_rdma", 1);
+    Status Install(const char* protocol = "device_rdma", bool store = false) {
+        if (protocol) {
+            setenv("MF_PROTOCOL", protocol, 1);
+        } else {
+            unsetenv("MF_PROTOCOL");
+        }
         auto conf = std::make_shared<Config>();
+        conf->set("transports/memfabric/store_te_init", store);
         return transport_->install(name_, metadata_, nullptr, conf);
+    }
+
+    std::string Protocol() const {
+        return transport_->config_.data_op_type_str;
     }
 
     int InflightCount() const { return transport_->inflight_.load(); }
@@ -400,6 +424,16 @@ class MemFabricTransportTest : public ::testing::Test {
 
     void InstallMockApi();
     void ResetMockApi();
+    std::weak_ptr<const MemFabricUnderApi::MemoryApi> InstallMemoryApi(
+        std::shared_ptr<void> library = nullptr) {
+        auto api = std::make_shared<MemFabricUnderApi::MemoryApi>();
+        api->library = std::move(library);
+        api->allocate = mockSmemMemAlloc;
+        api->free = mockSmemMemFree;
+        MemFabricUnderApi::gMemoryApi = api;
+        MemFabricUnderApi::gMemoryApiWeak = api;
+        return api;
+    }
 
     std::shared_ptr<MockMemFabricState> state_;
     std::shared_ptr<ControlService> metadata_;
@@ -409,6 +443,7 @@ class MemFabricTransportTest : public ::testing::Test {
 };
 
 void MemFabricTransportTest::InstallMockApi() {
+    InstallMemoryApi();
     MemFabricUnderApi::gLoaded = true;
     MemFabricUnderApi::gLibHandle = nullptr;
     MemFabricUnderApi::pSmemTransInit = &mockSmemTransInit;
@@ -428,20 +463,74 @@ void MemFabricTransportTest::InstallMockApi() {
 }
 
 void MemFabricTransportTest::ResetMockApi() {
-    MemFabricUnderApi::gLoaded = false;
-    MemFabricUnderApi::gLibHandle = nullptr;
-    MemFabricUnderApi::pSmemTransInit = nullptr;
-    MemFabricUnderApi::pSmemTransUninit = nullptr;
-    MemFabricUnderApi::pSmemTransConfigInit = nullptr;
-    MemFabricUnderApi::pSmemTransCreate = nullptr;
-    MemFabricUnderApi::pSmemTransDestroy = nullptr;
-    MemFabricUnderApi::pSmemTransGetRpcPort = nullptr;
-    MemFabricUnderApi::pSmemTransRegisterMem = nullptr;
-    MemFabricUnderApi::pSmemTransBatchRegisterMem = nullptr;
-    MemFabricUnderApi::pSmemTransDeregisterMem = nullptr;
-    MemFabricUnderApi::pSmemTransBatchCopy = nullptr;
-    MemFabricUnderApi::pSmemTransBatchStatusQuery = nullptr;
-    MemFabricUnderApi::pSmemSetLogLevel = nullptr;
+    MemFabricUnderApi::CleanupLibrary();
+    MemFabricUnderApi::gMemoryApiWeak.reset();
+}
+
+TEST_F(MemFabricTransportTest, SharedAllocationsRetainLibraryAfterUninstall) {
+    auto closed = std::make_shared<int>(0);
+    auto api = InstallMemoryApi(std::shared_ptr<void>(
+        reinterpret_cast<void*>(1), [closed](void*) { ++*closed; }));
+    ASSERT_TRUE(Install("device_sdma").ok());
+    auto release = [](void* ptr) { memfabric_free_memory("ascend", ptr); };
+    std::unique_ptr<void, decltype(release)> first(
+        memfabric_allocate_memory(64, "ascend"), release);
+    std::unique_ptr<void, decltype(release)> second(
+        memfabric_allocate_memory(64, "ascend"), release);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    ASSERT_TRUE(transport_->uninstall().ok());
+    EXPECT_FALSE(MemFabricUnderApi::IsLoaded());
+    EXPECT_EQ(*closed, 0);
+    first.reset();
+    EXPECT_FALSE(api.expired());
+    EXPECT_EQ(*closed, 0);
+    second.reset();
+    EXPECT_TRUE(api.expired());
+    EXPECT_EQ(*closed, 1);
+}
+
+TEST_F(MemFabricTransportTest, NativeHostMemoryIgnoresMmapHints) {
+    InstallMemoryApi();
+    setenv("MF_STORE_PROTOCOL", "device_sdma", 1);
+    ASSERT_TRUE(Install("device_rdma").ok());
+    EXPECT_TRUE(memfabric_use_fabric_mem("ascend"));
+    EXPECT_FALSE(memfabric_use_fabric_mem("tcp"));
+    size_t actual_size = 0;
+    auto release = [](void* ptr) { memfabric_free_memory("ascend", ptr); };
+    std::unique_ptr<void, decltype(release)> buffer(
+        memfabric_allocate_memory_best_effort(
+            64, "ascend", &actual_size,
+            [](size_t, size_t, bool) -> void* {
+                ADD_FAILURE() << "Native Host memory must not use mmap";
+                return nullptr;
+            },
+            2 * 1024 * 1024, true),
+        release);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(actual_size, 64u);
+    setenv("MF_STORE_PROTOCOL", "device_rdma", 1);
+    EXPECT_FALSE(memfabric_use_fabric_mem("ascend"));
+    buffer.reset();
+    EXPECT_EQ(state_->mem_free_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, RdmaMemoryHonorsHostAllocationCallback) {
+    setenv("MF_STORE_PROTOCOL", "device_rdma", 1);
+    ASSERT_TRUE(Install("device_sdma").ok());
+    size_t actual_size = 0;
+    void* buffer = memfabric_allocate_memory_best_effort(
+        64, "ascend", &actual_size,
+        [](size_t size, size_t alignment, bool defer_population) -> void* {
+            EXPECT_EQ(alignment, 4096u);
+            EXPECT_TRUE(defer_population);
+            return std::malloc(size);
+        },
+        4096, true);
+    EXPECT_NE(buffer, nullptr);
+    EXPECT_EQ(actual_size, 64u);
+    std::free(buffer);
+    EXPECT_EQ(state_->mem_free_calls, 0);
 }
 
 TEST_F(MemFabricTransportTest, InstallSucceeds) {
@@ -449,6 +538,50 @@ TEST_F(MemFabricTransportTest, InstallSucceeds) {
     EXPECT_EQ(state_->init_calls, 1);
     EXPECT_EQ(state_->create_calls, 1);
     EXPECT_EQ(state_->get_rpc_port_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, StoreProtocolOverridesTransportAndAllocator) {
+    for (const auto* store_protocol : {"device_rdma", "device_sdma"}) {
+        SCOPED_TRACE(store_protocol);
+        InstallMockApi();
+        setenv("MF_STORE_PROTOCOL", store_protocol, 1);
+        ASSERT_TRUE(Install("device_urma").ok());
+        EXPECT_EQ(Protocol(), "device_urma");
+        ASSERT_TRUE(transport_->uninstall().ok());
+        InstallMockApi();
+        ASSERT_TRUE(Install("device_urma", true).ok());
+        EXPECT_EQ(Protocol(), store_protocol);
+        EXPECT_EQ(memfabric_use_fabric_mem("ascend"),
+                  std::string(store_protocol) == "device_sdma");
+        EXPECT_STREQ(std::getenv("MF_PROTOCOL"), "device_urma");
+        EXPECT_STREQ(std::getenv("MF_STORE_PROTOCOL"), store_protocol);
+        ASSERT_TRUE(transport_->uninstall().ok());
+    }
+}
+
+TEST_F(MemFabricTransportTest, StoreProtocolFallbackAndValidation) {
+    ASSERT_TRUE(Install("device_sdma", true).ok());
+    EXPECT_EQ(Protocol(), "device_sdma");
+    ASSERT_TRUE(transport_->uninstall().ok());
+    InstallMockApi();
+    setenv("MF_STORE_PROTOCOL", "", 1);
+    ASSERT_TRUE(Install("device_rdma", true).ok());
+    EXPECT_EQ(Protocol(), "device_rdma");
+    ASSERT_TRUE(transport_->uninstall().ok());
+    InstallMockApi();
+    setenv("MF_STORE_PROTOCOL", "device_sdma", 1);
+    EXPECT_FALSE(Install(nullptr).ok());
+    ASSERT_TRUE(Install(nullptr, true).ok());
+    EXPECT_EQ(Protocol(), "device_sdma");
+    EXPECT_TRUE(memfabric_use_fabric_mem("ascend"));
+    EXPECT_EQ(std::getenv("MF_PROTOCOL"), nullptr);
+    ASSERT_TRUE(transport_->uninstall().ok());
+    InstallMockApi();
+    setenv("MF_STORE_PROTOCOL", "invalid", 1);
+    ASSERT_TRUE(Install("device_rdma").ok());
+    ASSERT_TRUE(transport_->uninstall().ok());
+    EXPECT_FALSE(Install("device_rdma", true).ok());
+    EXPECT_STREQ(std::getenv("MF_PROTOCOL"), "device_rdma");
 }
 
 TEST_F(MemFabricTransportTest, InstallFailsWhenCreateReturnsNull) {
