@@ -10,6 +10,7 @@
 #include <optional>
 #include <utility>
 
+#include "memfabric_allocator.h"
 #include "tent/common/utils/ip.h"
 
 namespace mooncake {
@@ -56,13 +57,14 @@ MemFabricSubBatch::~MemFabricSubBatch() {
 MemFabricTransport::MemFabricTransport() = default;
 MemFabricTransport::~MemFabricTransport() { (void)uninstall(); }
 
-Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>&) {
-    const char* protocol_env = std::getenv("MF_PROTOCOL");
-    config_.data_op_type_str = protocol_env ? protocol_env : "";
+Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
+    const bool store =
+        conf && conf->get("transports/memfabric/store_te_init", false);
+    config_.data_op_type_str = memfabric_get_protocol(store);
     if (config_.data_op_type_str.empty()) {
-        LOG(ERROR) << "MF_PROTOCOL env var not set";
         return Status::InvalidArgument(
-            "MF_PROTOCOL must be set (device_sdma/device_rdma/...)" LOC_MARK);
+            store ? "MF_STORE_PROTOCOL or MF_PROTOCOL must be set" LOC_MARK
+                  : "MF_PROTOCOL must be set" LOC_MARK);
     }
     config_.data_op_type = parseDataOpType(config_.data_op_type_str);
     if (!config_.data_op_type.has_value()) {
@@ -70,7 +72,8 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>&) {
         return Status::InvalidArgument(
             "Invalid data_op_type: " + config_.data_op_type_str + LOC_MARK);
     }
-    LOG(INFO) << "data_op_type=" << config_.data_op_type_str;
+    LOG(INFO) << "data_op_type=" << config_.data_op_type_str
+              << ", store_te_init=" << store;
 
     transfer_timeout_ms_ = 10000;
     const char* timeout_env = std::getenv("MF_TRANSFER_TIMEOUT");
@@ -478,19 +481,23 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
 
 Status MemFabricTransport::addMemoryBuffer(BufferDesc& desc,
                                            const MemoryOptions& options) {
-    (void)options;
     LOG(INFO) << "addMemoryBuffer: addr=" << desc.addr
               << ", length=" << desc.length;
     if (!handle_) {
         LOG(ERROR) << "addMemoryBuffer called before install";
         return Status::InternalError("not installed" LOC_MARK);
     }
-    auto ret = MemFabricUnderApi::SmemTransRegisterMem(
-        handle_, reinterpret_cast<void*>(desc.addr), desc.length, 0);
-    if (ret != 0) {
-        LOG(ERROR) << "smem_trans_register_mem failed, ret=" << ret
-                   << ", addr=" << desc.addr << ", length=" << desc.length;
-        return Status::InternalError("register_mem failed" LOC_MARK);
+
+    const bool local_sdma = config_.data_op_type == SMEMB_DATA_OP_SDMA &&
+                            options.perm == kLocalReadWrite;
+    if (!local_sdma) {
+        auto ret = MemFabricUnderApi::SmemTransRegisterMem(
+            handle_, reinterpret_cast<void*>(desc.addr), desc.length, 0);
+        if (ret != 0) {
+            LOG(ERROR) << "smem_trans_register_mem failed, ret=" << ret
+                       << ", addr=" << desc.addr << ", length=" << desc.length;
+            return Status::InternalError("register_mem failed" LOC_MARK);
+        }
     }
     desc.transports.push_back(MEMFABRIC);
     desc.transport_attrs[MEMFABRIC] = "";
@@ -508,6 +515,9 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
 
 Status MemFabricTransport::removeMemoryBuffer(BufferDesc& desc) {
     if (!handle_) return Status::OK();
+    if (config_.data_op_type == SMEMB_DATA_OP_SDMA &&
+        desc.permission == kLocalReadWrite)
+        return Status::OK();
     LOG(INFO) << "removeMemoryBuffer: addr=" << desc.addr;
     auto ret = MemFabricUnderApi::SmemTransDeregisterMem(
         handle_, reinterpret_cast<void*>(desc.addr));
