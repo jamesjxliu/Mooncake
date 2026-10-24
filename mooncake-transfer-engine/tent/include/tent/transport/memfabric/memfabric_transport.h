@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -82,6 +83,11 @@ class MemFabricTransport : public Transport {
     // Caller holds inflight_mu_; shared by public polling and quiesce().
     Status getTransferStatusLocked(SubBatchRef batch, int task_id,
                                    TransferStatus& status);
+
+    // SMEM retains native registrations until handle destruction. Keep their
+    // aligned coverage across logical remove/re-add calls as well.
+    std::map<uint64_t, uint64_t> registered_ranges_;  // [begin, end)
+    std::mutex registration_mu_;
 
     bool installed_{false};
     smem_trans_t handle_{nullptr};
