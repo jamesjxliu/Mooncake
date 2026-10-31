@@ -155,6 +155,9 @@ fi
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 
+# Kernel header tree the CUDA EP JIT compiles against at runtime.
+CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
+
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
@@ -164,6 +167,11 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
         cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
         echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            cp -r "$CUDA_EP_JIT_DIR" "$CUDA_EP_STAGING_TEMP/"
+            CUDA_EP_JIT_DIR="${CUDA_EP_STAGING_TEMP}/mooncake_ep_jit"
+            echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
+        fi
     fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf "${BUILD_DIR}/"
@@ -177,7 +185,7 @@ fi
 # the host extension.  It is explicitly excluded below and injected later.
 export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
 
-if [ "$NPU_BUILD" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ] || [ "${NPU_MEMFABRIC_BUILD:-0}" = "1" ]; then
     echo "Stripping shared libraries to reduce wheel size..."
     find mooncake-wheel/mooncake -name "*.so" -exec strip --strip-unneeded {} \;
     echo "Pre-setting RPATH=\$ORIGIN on project ELF files so auditwheel resolves NEEDED from wheel-internal copies..."
@@ -197,6 +205,7 @@ MIGRATED_PYTHON_MODULES=(
     py.typed
     engine.pyi
     structured_object_store.py
+    _structured_ranges.py
     _fast_copy.c
     http_metadata_server.py
     _launcher.py
@@ -259,7 +268,7 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD NPU_MEMFABRIC_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -312,6 +321,18 @@ elif [ "$NPU_BUILD" = "1" ]; then
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-npu"
+elif [ "${NPU_MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Modifying package name for Ascend NPU memfabric build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-memfabric"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Ascend NPU TENT memfabric version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "ascend", "npu", "tent", "memfabric"]/' pyproject.toml
+    sed -i 's/^requires-python = ">=3.10"$/requires-python = ">=3.9"/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-memfabric"
 elif [ "$EFA_BUILD" = "1" ]; then
     echo "Modifying package name for AWS EFA build (CUDA)"
     # Backup original pyproject.toml
@@ -376,7 +397,7 @@ echo "Installing required build packages"
 # rocm/musa CI images built on it) is 0.14.3, which makes `auditwheel repair`
 # abort. The PyPI wheel lands ahead of /usr/bin on PATH and works everywhere
 # the Python toolchain does.
-if [ "$NPU_BUILD" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ] || [ "${NPU_MEMFABRIC_BUILD:-0}" = "1" ]; then
     PYTHON_CMD="python${PYTHON_VERSION}"
     if ! command -v "$PYTHON_CMD" &>/dev/null; then
         echo "Error: $PYTHON_CMD not found for NPU wheel build"
@@ -465,7 +486,7 @@ echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-if [ "$NPU_BUILD" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ] || [ "${NPU_MEMFABRIC_BUILD:-0}" = "1" ]; then
     python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
     AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
 else
@@ -609,6 +630,11 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
                 cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
             fi
         done
+        # Kernel headers for the EP JIT (runtime nvcc).
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            echo "  Adding EP JIT header tree"
+            cp -r "$CUDA_EP_JIT_DIR" "$UNPACKED_PKG_DIR/mooncake/"
+        fi
         # The host EP extension is repaired before the device library is
         # injected.  auditwheel therefore only adds its vendored .libs path;
         # add the package directory as well so the sibling device library is
@@ -632,7 +658,7 @@ if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
 fi
 # NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
 # on all ELF files so everything resolves from a single directory.
-if [ "$NPU_BUILD" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ] || [ "${NPU_MEMFABRIC_BUILD:-0}" = "1" ]; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
         WHEEL_UNPACK_DIR=$(mktemp -d)
